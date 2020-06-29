@@ -20,53 +20,54 @@ package main
 
 import (
 	"flag"
+	"github.com/davecgh/go-spew/spew"
+	log "github.com/sirupsen/logrus"
+	"github.com/yunify/hostnic-cni/pkg/db"
+	"github.com/yunify/hostnic-cni/pkg/ipam"
+	k8sapi "github.com/yunify/hostnic-cni/pkg/k8sclient"
+	log2 "github.com/yunify/hostnic-cni/pkg/log"
+	"github.com/yunify/hostnic-cni/pkg/networkutils"
+	"github.com/yunify/hostnic-cni/pkg/qcclient"
+	"github.com/yunify/hostnic-cni/pkg/signals"
 	"github.com/yunify/hostnic-cni/pkg/types"
 	"os"
-	"os/signal"
-	"syscall"
-
-	"github.com/coreos/go-systemd/daemon"
-	"github.com/yunify/hostnic-cni/pkg/ipam"
-	"k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/rest"
-	"k8s.io/klog"
 )
 
-func init() {
-	klog.InitFlags(nil)
-	flag.Parse()
-}
-
 func main() {
-	stopCh := make(chan struct{})
-	stopSignal := make(chan os.Signal)
-	signal.Notify(stopSignal, os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
-	daemon.SdNotify(false, "READY=1")
-	go func() {
-		defer close(stopSignal)
-		for range stopSignal {
-			stopCh <- struct{}{}
-		}
-	}()
+	//parse flag and setup log
+	logOpts := log2.NewLogOptions()
+	logOpts.AddFlags()
 
-	var err error
-	config, err := rest.InClusterConfig()
-	if err != nil {
-		klog.Fatalf("Failed to get k8s config, err:%v", err)
-	}
+	dbOpts := db.NewLevelDBOptions()
+	dbOpts.AddFlags()
 
-	clientset, err := kubernetes.NewForConfig(config)
-	if err != nil {
-		klog.Fatalf("Failed to get k8s clientset, err:%v", err)
-	}
-	err = ipam.Start(clientset, types.StopCh)
-	if err != nil {
-		klog.Fatalf("Failed to start ipamd, err:%v", err)
-	}
+	flag.Parse()
+	log2.Setup(logOpts)
+	db.InitLevelDB(dbOpts)
 
+
+	// set up signals so we handle the first shutdown signals gracefully
+	stopCh := signals.SetupSignalHandler()
+
+	k8sClient := k8sapi.NewK8sHelper(stopCh)
+	qcClient := qcclient.NewQingCloudClient()
+
+	conf := ipam.TryLoadFromDisk(types.DefaultConfigName, types.DefaultConfigPath)
+	log.Infof("hostnic config is %s", spew.Sdump(conf))
+
+	netlink := networkutils.NetworkUtils{}
+	udev := ipam.Udev{}
+	pool := ipam.NewPoolManager(qcClient, conf.Pool, udev, netlink)
+	pool.Start(stopCh)
+
+	ipamd := ipam.NewIpamD(k8sClient, &conf.Server, pool)
+	ipamd.Start(stopCh)
+
+	log.Info("all setup done, wait on stopCh")
 	select {
 	case <-stopCh:
-		klog.Info("Daemon exit")
+		log.Info("Daemon exit")
+		db.CloseDB()
 		os.Exit(0)
 	}
 }

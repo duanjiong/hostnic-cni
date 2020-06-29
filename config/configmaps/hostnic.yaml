@@ -1,0 +1,25 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: hostnic-cfg-cm
+data:
+  hostnic: |
+    {
+      "pool":{
+        "poolhigh":3,
+        "poollow":3,
+        "maxnic":60,
+        "delay": 3
+      }
+    }
+  hostnic-cni: |
+    {
+      "cniVersion": "0.3.0",
+      "name": "hostnic",
+      "type": "hostnic",
+      "ipam": {
+        "type": "hostnic-ipam"
+      },
+      "hostnic_type": "passthrough",
+      "service_cidr" : "10.233.0.0/18"
+    }

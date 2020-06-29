@@ -1,22 +1,15 @@
 package k8sclient
 
 import (
-	"fmt"
-	"github.com/yunify/hostnic-cni/pkg/types"
-	v1 "k8s.io/api/core/v1"
-	"os"
-	"time"
-
-	corev1 "k8s.io/api/core/v1"
+	log "github.com/sirupsen/logrus"
 	"k8s.io/client-go/informers"
 	coreinformer "k8s.io/client-go/informers/core/v1"
-	corev1informer "k8s.io/client-go/informers/core/v1"
 	"k8s.io/client-go/kubernetes"
-	clientsetcorev1 "k8s.io/client-go/kubernetes/typed/core/v1"
 	corelisters "k8s.io/client-go/listers/core/v1"
+	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/cache"
-	"k8s.io/client-go/util/retry"
-	"k8s.io/klog"
+	"os"
+	"time"
 )
 
 const (
@@ -26,83 +19,54 @@ const (
 
 // K8sHelper is used to commucate with k8s apiserver
 type K8sHelper interface {
-	Start(stopCh <-chan struct{}) error
-	GetCurrentNode() (*corev1.Node, error)
-	UpdateNodeAnnotation(key, value string) error
 	GetCurrentNodePods() ([]*K8SPodInfo, error)
+	GetPodInfo(namespace, name string) (*K8SPodInfo, error)
+	GetNodeInfo() (string, error)
+	UpdatePodInfo(podInfo *K8SPodInfo) error
 }
 
 type k8sHelper struct {
-	nodeName      string
-	nodeInformer  corev1informer.NodeInformer
-	nodeInterface clientsetcorev1.NodeInterface
-
-	podInformer coreinformer.PodInformer
-	podLister   corelisters.PodLister
-	podSynced   cache.InformerSynced
+	nodeName     string
+	clientset    kubernetes.Interface
+	nodeLister   corelisters.NodeLister
+	nodeSynced   cache.InformerSynced
+	nodeInformer coreinformer.NodeInformer
+	podInformer  coreinformer.PodInformer
+	podLister    corelisters.PodLister
+	podSynced    cache.InformerSynced
 }
 
-func (k *k8sHelper) GetCurrentNode() (*corev1.Node, error) {
-	return k.nodeInformer.Lister().Get(k.nodeName)
-}
-
-func (k *k8sHelper) Start(stopCh <-chan struct{}) error {
-	nodeUpdate := func(old interface{}, new interface{}) {
-		oldNode := old.(*v1.Node)
-		newNode := new.(*v1.Node)
-
-		newAnnotation := newNode.Annotations[types.NodeAnnotationVxNet]
-		oldAnnotation := oldNode.Annotations[types.NodeAnnotationVxNet]
-		if newAnnotation != oldAnnotation {
-			klog.Infof("k8s node update: from  %s:%s to %s:%s", oldNode.Name, oldAnnotation, newNode, newAnnotation)
-			types.NodeNotify <- newAnnotation
-		}
+func NewK8sHelper(stopCh <-chan struct{}) K8sHelper {
+	config, err := rest.InClusterConfig()
+	if err != nil {
+		log.Fatalf("Failed to get k8s config, err:%v", err)
 	}
-	k.nodeInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
-		UpdateFunc: nodeUpdate,
-	})
-
-	go k.nodeInformer.Informer().Run(stopCh)
-	go k.podInformer.Informer().Run(stopCh)
-
-	// Wait for the caches to be synced before starting workers
-	klog.V(2).Info("Waiting for informer caches to sync")
-	if ok := cache.WaitForCacheSync(stopCh, k.podSynced); !ok {
-		return fmt.Errorf("failed to wait for caches to sync")
+	clientset, err := kubernetes.NewForConfig(config)
+	if err != nil {
+		log.Fatalf("Failed to get k8s clientset, err:%v", err)
 	}
 
-	return nil
-}
-
-func NewK8sHelper(clientset kubernetes.Interface) K8sHelper {
 	nodeName := os.Getenv(NodeNameEnvKey)
 	kubeInformerFactory := informers.NewSharedInformerFactory(clientset, time.Minute*1)
-	nodeInformer := kubeInformerFactory.Core().V1().Nodes()
 	podInformer := kubeInformerFactory.Core().V1().Pods()
+	nodeInformer := kubeInformerFactory.Core().V1().Nodes()
 
-	cont := &k8sHelper{
-		nodeName:      nodeName,
-		nodeInformer:  nodeInformer,
-		nodeInterface: clientset.CoreV1().Nodes(),
-		podInformer:   podInformer,
-		podLister:     podInformer.Lister(),
-		podSynced:     podInformer.Informer().HasSynced,
+	helper := &k8sHelper{
+		nodeName:     nodeName,
+		clientset:    clientset,
+		podInformer:  podInformer,
+		podLister:    podInformer.Lister(),
+		podSynced:    podInformer.Informer().HasSynced,
+		nodeInformer: nodeInformer,
+		nodeLister:   nodeInformer.Lister(),
+		nodeSynced:   nodeInformer.Informer().HasSynced,
 	}
-	return cont
-}
 
-func (k *k8sHelper) UpdateNodeAnnotation(key, value string) error {
-	return retry.RetryOnConflict(retry.DefaultBackoff, func() error {
-		node, err := k.GetCurrentNode()
-		if err != nil {
-			return err
-		}
-		if node.Annotations == nil {
-			node.Annotations = make(map[string]string)
-		}
+	go podInformer.Informer().Run(stopCh)
+	go nodeInformer.Informer().Run(stopCh)
 
-		node.Annotations[key] = value
-		_, err = k.nodeInterface.Update(node)
-		return err
-	})
+	if ok := cache.WaitForCacheSync(stopCh, helper.podSynced, helper.nodeSynced); !ok {
+		log.Fatal("failed to wait for caches to sync")
+	}
+	return helper
 }

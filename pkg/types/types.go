@@ -19,21 +19,47 @@
 package types
 
 import (
+	"fmt"
+	"github.com/containernetworking/cni/pkg/types"
 	"net"
+	"time"
 )
 
 const (
-	// NodeAnnotationVxNet will tell hostnic the node which vxnet to use when creating nic
-	NodeAnnotationVxNet = "node.beta.kubernetes.io/vxnet"
+	DefaultSocketPath     = "/var/run/hostnic/hostnic.socket"
+	DefaultUnixSocketPath = "unix://" + DefaultSocketPath
+	DefaultConfigPath     = "/etc/hostnic"
+	DefaultPoolSyn        = 3
+	DefaultIAASApiTimeout = 30 *time.Second
+	DefaultDeleteNicDelay = 10 * time.Second
+	DefaultNicCool        = 60
+	DefaultConfigName     = "hostnic"
+	DefaultPoolSize       = 3
+	DefaultMaxPoolSize    = 5
+	DefaultRetryNum       = 3
+	NicNumLimit           = 63
+	DefaultRouteTableBase = 260
+	NicPrefix             = "hostnic_"
 )
+
+func GetHostNicName(routeTableNum int) string {
+	if routeTableNum <= 0 {
+		panic("invalid RouteTableNum")
+	}
+	return fmt.Sprintf("%s%d", NicPrefix, routeTableNum)
+}
 
 type HostNic struct {
 	ID           string `json:"id"`
 	VxNet        *VxNet `json:"vxNet"`
 	HardwareAddr string `json:"hardwareAddr"`
 	Address      string `json:"address"`
-	DeviceNumber int    `json:"deviceNumber"`
-	IsPrimary    bool   `json:"IsPrimary"`
+
+	RouteTableNum int //setup when setup network
+
+	IsPrimary bool `json:"IsPrimary"` //only use when setup
+	Using     bool `json:"using"`     //only use when setup
+	Reserved  bool //used when nic was created by user
 }
 
 type VxNet struct {
@@ -44,7 +70,6 @@ type VxNet struct {
 	Network *net.IPNet `json:"network"`
 	//RouterId
 	RouterID string `json:"router_id"`
-	Name     string `json:"name"`
 }
 
 type HostInstance struct {
@@ -56,7 +81,6 @@ type HostInstance struct {
 type VPC struct {
 	Network *net.IPNet
 	ID      string
-	VxNets  []*VxNet
 }
 
 type ResourceType string
@@ -65,24 +89,33 @@ const (
 	ResourceTypeInstance ResourceType = "instance"
 	ResourceTypeVxnet    ResourceType = "vxnet"
 	ResourceTypeNic      ResourceType = "nic"
-	ResourceTypeTag      ResourceType = "tag"
 	ResourceTypeVPC      ResourceType = "vpc"
 )
 
-// Tag including resources which have same labels
-type Tag struct {
-	Label           string
-	ID              string
-	TaggedResources []*TaggedResource
+type NetConf struct {
+	CNIVersion   string          `json:"cniVersion,omitempty"`
+	Name         string          `json:"name,omitempty"`
+	Type         string          `json:"type,omitempty"`
+	Capabilities map[string]bool `json:"capabilities,omitempty"`
+	IPAM         struct {
+		Name string
+		Type string `json:"type"`
+	} `json:"ipam,omitempty"`
+	MTU            int    `json:"mtu"`
+	HostVethPrefix string `json:"veth_prefix"`
+	HostNicType    string `json:"hostnic_type"`
+	Service        string `json:"service_cidr"`
 }
 
-// TaggedResource is the result returned by GetTagXX, showing the resources under the tag
-type TaggedResource struct {
-	ResourceType
-	ResourceID string
-}
-
-type IpsetVxnet struct {
-	action string
-	VxNets []*VxNet
+// K8sArgs is the valid CNI_ARGS used for Kubernetes
+type K8sArgs struct {
+	types.CommonArgs
+	// IP is pod's ip address
+	IP net.IP
+	// K8S_POD_NAME is pod's name
+	K8S_POD_NAME types.UnmarshallableString
+	// K8S_POD_NAMESPACE is pod's namespace
+	K8S_POD_NAMESPACE types.UnmarshallableString
+	// K8S_POD_INFRA_CONTAINER_ID is pod's container id
+	K8S_POD_INFRA_CONTAINER_ID types.UnmarshallableString
 }

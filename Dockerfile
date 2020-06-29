@@ -4,10 +4,9 @@ RUN apk --no-cache add iptables ipset ca-certificates \
 WORKDIR /app
 
 ADD bin .
-ADD config .
 ADD scripts .
 
-ENTRYPOINT [ "/app/install_hostnic.sh" ]
+ENTRYPOINT [ "sh /app/install_hostnic.sh" ]
 
 
 

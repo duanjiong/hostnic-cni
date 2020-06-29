@@ -1,56 +1,70 @@
 package networkutils
 
 import (
-	"encoding/binary"
-	"fmt"
-	"io"
+	"github.com/vishvananda/netlink"
+	"golang.org/x/sys/unix"
 	"net"
-	"os"
+	"syscall"
 )
 
-type stringWriteCloser interface {
-	io.Closer
-	WriteString(s string) (int, error)
+// containsNoSuchRule report whether the rule is not exist
+func containsNoSuchRule(err error) bool {
+	if errno, ok := err.(syscall.Errno); ok {
+		return errno == syscall.ENOENT
+	}
+	return false
 }
 
-// GetVPNNet return the ip from the vpn tunnel, which in most time is the x.x.255.254
-func GetVPNNet(ip string) string {
-	i := net.ParseIP(ip).To4()
-	i[2] = 255
-	i[3] = 254
-	addr := &net.IPNet{
-		IP:   i,
-		Mask: net.IPv4Mask(255, 255, 255, 255),
+// isRuleExistsError report whether the rule is exist
+func isRuleExistsError(err error) bool {
+	if errno, ok := err.(syscall.Errno); ok {
+		return errno == syscall.EEXIST
 	}
-	return addr.String()
+	return false
 }
 
-// incrementIPv4Addr returns incremented IPv4 address
-func incrementIPv4Addr(ip net.IP) (net.IP, error) {
-	ip4 := ip.To4()
-	if ip4 == nil {
-		return nil, fmt.Errorf("%q is not a valid IPv4 Address", ip)
+
+// isNotExistsError returns true if the error type is syscall.ESRCH
+// This helps us determine if we should ignore this error as the route
+// that we want to cleanup has been deleted already routing table
+func isNotExistsError(err error) bool {
+	if errno, ok := err.(syscall.Errno); ok {
+		return errno == syscall.ENOENT
 	}
-	intIP := binary.BigEndian.Uint32([]byte(ip4))
-	if intIP == (1<<32 - 1) {
-		return nil, fmt.Errorf("%q will be overflowed", ip)
-	}
-	intIP++
-	bytes := make([]byte, 4)
-	binary.BigEndian.PutUint32(bytes, intIP)
-	return net.IP(bytes), nil
+	return false
 }
 
-func setProcSysByWritingFile(key, value string) error {
-	f, err := os.OpenFile(key, os.O_WRONLY, 0644)
+// isRouteExistsError returns true if the error type is syscall.EEXIST
+// This helps us determine if we should ignore this error as the route
+// we want to add has been added already in routing table
+func isRouteExistsError(err error) bool {
+	if errno, ok := err.(syscall.Errno); ok {
+		return errno == syscall.EEXIST
+	}
+	return false
+}
+
+// isNetworkUnreachableError returns true if the error type is syscall.ENETUNREACH
+// This helps us determine if we should ignore this error as the route the call
+// depends on is not plumbed ready yet
+func isNetworkUnreachableError(err error) bool {
+	if errno, ok := err.(syscall.Errno); ok {
+		return errno == syscall.ENETUNREACH
+	}
+	return false
+}
+
+
+func getRuleListBySrc(src net.IPNet) ([]netlink.Rule, error) {
+	var srcRuleList []netlink.Rule
+	ruleList, err := netlink.RuleList(unix.AF_INET)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	_, err = f.WriteString(value)
-	if err != nil {
-		// If the write failed, just close
-		_ = f.Close()
-		return err
+	for _, rule := range ruleList {
+		if rule.Src != nil && rule.Src.IP.Equal(src.IP) {
+			srcRuleList = append(srcRuleList, rule)
+		}
 	}
-	return f.Close()
+	return srcRuleList, nil
 }

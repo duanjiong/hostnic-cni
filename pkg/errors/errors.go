@@ -1,11 +1,20 @@
 package errors
 
 import (
+	"errors"
 	"fmt"
-	"strings"
-	"syscall"
-
 	"github.com/yunify/hostnic-cni/pkg/types"
+)
+
+var (
+	// ErrUnknownPodIP is an error where pod's IP address is not found in data store
+	ErrUnknownPodIP  = errors.New("datastore: pod using unknown IP address")
+	ErrNoAvailableIP = errors.New("datastore: no available IP address")
+	ErrIPReleased    = errors.New("datastore: IP address has released")
+
+	ErrResourceBusy = errors.New("qcclient: resource is busy, try later")
+
+	ErrNotFound = errors.New("Resource not found")
 )
 
 type ErrorType string
@@ -65,24 +74,4 @@ func IsCommonServerError(e error) bool {
 		return true
 	}
 	return false
-}
-
-// ContainsNoSuchRule report whether the rule is not exist
-func ContainsNoSuchRule(err error) bool {
-	if errno, ok := err.(syscall.Errno); ok {
-		return errno == syscall.ENOENT
-	}
-	return false
-}
-
-// IsRuleExistsError report whether the rule is exist
-func IsRuleExistsError(err error) bool {
-	if errno, ok := err.(syscall.Errno); ok {
-		return errno == syscall.EEXIST
-	}
-	return false
-}
-
-func ContainChainExistErr(err error) bool {
-	return strings.Contains(err.Error(), "Chain already exists")
 }

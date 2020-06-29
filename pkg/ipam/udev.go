@@ -1,47 +1,89 @@
 package ipam
 
 import (
-	"github.com/yunify/hostnic-cni/pkg/go-udev"
-	"k8s.io/klog"
+	"bytes"
+	"fmt"
+	udev "github.com/pilebones/go-udev/netlink"
+	"github.com/sirupsen/logrus"
 	"strconv"
+	"strings"
 )
 
-type udevNotify struct {
-	action string
-	index  int
-	name   string
-	mac    string
+type UdevNotify struct {
+	Action string
+	MAC    string
+	index  int    //unused
+	name   string //unused
 }
 
-// monitor run monitor mode
-func (s *IpamD) monitor() {
-	conn := new(go_udev.UEventConn)
-	if err := conn.Connect(go_udev.UdevEvent); err != nil {
-		klog.Error("Unable to connect to Netlink Kobject UEvent socket")
-		return
+func SplitSubN(s string, n int) []string {
+	sub := ""
+	subs := []string{}
+
+	runes := bytes.Runes([]byte(s))
+	l := len(runes)
+	for i, r := range runes {
+		sub = sub + string(r)
+		if (i+1)%n == 0 {
+			subs = append(subs, sub)
+			sub = ""
+		} else if (i + 1) == l {
+			subs = append(subs, sub)
+		}
+	}
+
+	return subs
+}
+
+func FormatMac(str string) string {
+	str = strings.TrimPrefix(str, "enx")
+	return strings.Join(SplitSubN(str, 2), ":")
+}
+
+type Udev struct {
+}
+
+type UdevFake struct {
+}
+
+func (u UdevFake) Monitor(trigCh chan UdevNotify) {
+
+}
+
+type UdevAPI interface {
+	Monitor(trigCh chan UdevNotify)
+}
+
+// Monitor run Monitor mode
+func (u Udev) Monitor(trigCh chan UdevNotify) {
+	conn := new(udev.UEventConn)
+	if err := conn.Connect(udev.UdevEvent); err != nil {
+		panic(fmt.Sprintf("Cannot init udev: err=%+v", err))
 	}
 	defer conn.Close()
 
-	var matchers go_udev.RuleDefinitions
-	actions_add := "add"
-	matcher := go_udev.RuleDefinition{
-		Action: &actions_add,
-		Env:    make(map[string]string),
-	}
-	matcher.Env["SUBSYSTEM"] = "net"
-	matchers.AddRule(matcher)
-
-	actions_remove := "remove"
-	matcher = go_udev.RuleDefinition{
-		Action: &actions_remove,
-		Env:    make(map[string]string),
+	var matchers udev.RuleDefinitions
+	actionsAdd := "add"
+	matcher := udev.RuleDefinition{
+		Action: &actionsAdd,
+		Env: map[string]string{
+			"SUBSYSTEM": "net",
+		},
 	}
 	matchers.AddRule(matcher)
 
-	queue := make(chan go_udev.UEvent)
+	actionsRemove := "remove"
+	matcher = udev.RuleDefinition{
+		Action: &actionsRemove,
+		Env: map[string]string{
+			"SUBSYSTEM": "net",
+		},
+	}
+	matchers.AddRule(matcher)
+
+	queue := make(chan udev.UEvent)
 	errors := make(chan error)
 	conn.Monitor(queue, errors, &matchers)
-
 	// Handling message from queue
 	for {
 		select {
@@ -49,16 +91,16 @@ func (s *IpamD) monitor() {
 			if uevent.Action == "remove" || uevent.Action == "add" {
 				if uevent.Env["INTERFACE"] != "" {
 					index, _ := strconv.Atoi(uevent.Env["IFINDEX"])
-					s.trigCh <- udevNotify{
+					trigCh <- UdevNotify{
 						name:   uevent.Env["INTERFACE"],
-						mac:    uevent.Env["ID_NET_NAME_MAC"],
-						action: string(uevent.Action),
+						MAC:    FormatMac(uevent.Env["ID_NET_NAME_MAC"]),
+						Action: string(uevent.Action),
 						index:  index,
 					}
 				}
 			}
 		case err := <-errors:
-			klog.Errorf("ERROR: %v", err)
+			logrus.WithError(err).Error("IPAM udev recv error")
 		}
 	}
 }

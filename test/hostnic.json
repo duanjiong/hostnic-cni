@@ -1,0 +1,8 @@
+{
+  "pool":{
+    "poolhigh":3,
+    "poollow":3,
+    "maxnic":60,
+    "delay": 3
+  }
+}

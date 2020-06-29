@@ -1,53 +1,83 @@
 package ipam
 
 import (
-	"os"
-	"strings"
-	"text/template"
+	"fmt"
+	log "github.com/sirupsen/logrus"
+	"github.com/spf13/viper"
+	"github.com/yunify/hostnic-cni/pkg/types"
 )
 
-func (s *IpamD) WriteCNIConfig() error {
-	f, err := os.Create(configFileName)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-	var conf struct {
-		CniVersion string `json:"cniVersion"`
-		VethPrefix string `json:"vethPrefix,omitempty"`
-	}
-	conf.CniVersion = "0.3.1"
-	//TODO can be user defined
-	conf.VethPrefix = s.vethPrefix
-	templ :=
-		`{
-	"cniVersion": "{{.CniVersion}}",
-	"name": "hostnic-cni",
-	"plugins": [
-		{
-		"name": "hostnic",
-		"type": "hostnic",
-		"vethPrefix": "{{.VethPrefix}}"
-		}]
-}`
-	t, err := template.New("cni-config").Parse(templ)
-	if err != nil {
-		return err
-	}
-	return t.Execute(f, &conf)
+type IpamConf struct {
+	Pool   PoolConf   `json:"pool,omitempty" yaml:"pool,omitempty"`
+	Server ServerConf `json:"server,omitempty" yaml:"server,omitempty"`
 }
 
-func (s *IpamD) parseEnv() {
-	t := os.Getenv(envExtraTags)
-	if t != "" {
-		s.extraTags = strings.Split(t, ",")
+type PoolConf struct {
+	PoolHigh       int         `json:"poolhigh,omitempty" yaml:"poolhigh,omitempty"`
+	PoolLow        int         `json:"poollow,omitempty" yaml:"poollow,omitempty"`
+	MaxNic         int         `json:"maxnic,omitempty" yaml:"maxnic,omitempty"`
+	Delay          int         `json:"delay,omitempty" yaml:"delay,omitempty"`
+	RouteTableBase int         `json:"routeTableBase,omitempty" yaml:"routeTableBase,omitempty"`
+	Vxnet          []VxnetConf `json:"vxnets,omitempty" yaml:"vxnets,omitempty"`
+	Cool           int
+}
+
+type ServerConf struct {
+	ServerPath string `json:"serverpath,omitempty" yaml:"serverpath,omitempty"`
+}
+
+type VxnetConf struct {
+	Vxnet    string `json:"vxnet,omitempty" yaml:"vxnet,omitempty"`
+	PoolHigh int    `json:"poolhigh,omitempty" yaml:"poolhigh,omitempty"`
+	PoolLow  int    `json:"poollow,omitempty" yaml:"poollow,omitempty"`
+}
+
+// TryLoadFromDisk loads configuration from default location after server startup
+// return nil error if configuration file not exists
+func TryLoadFromDisk(name, path string) *IpamConf {
+	viper.SetConfigName(name)
+	viper.AddConfigPath(".")
+	viper.AddConfigPath(path)
+
+	conf := &IpamConf{
+		Pool: PoolConf{
+			PoolHigh:       types.DefaultMaxPoolSize,
+			PoolLow:        types.DefaultPoolSize,
+			MaxNic:         types.NicNumLimit,
+			Delay:          types.DefaultPoolSyn,
+			RouteTableBase: types.DefaultRouteTableBase,
+			Cool:           types.DefaultNicCool,
+		},
+		Server: ServerConf{
+			ServerPath: types.DefaultSocketPath,
+		},
 	}
-	s.clusterName = os.Getenv(envClusterName)
-	if s.clusterName == "" {
-		s.clusterName = defaultClusterName
+
+	if err := viper.ReadInConfig(); err != nil {
+		if _, ok := err.(viper.ConfigFileNotFoundError); ok {
+			log.WithError(err).Infof("use defualt value %+v", *conf)
+			return conf
+		} else {
+			panic(fmt.Errorf("error parsing configuration file %s", err))
+		}
 	}
-	s.vethPrefix = os.Getenv(envVethPrefix)
-	if s.vethPrefix == "" {
-		s.vethPrefix = defaultVethPrefix
+
+	if err := viper.Unmarshal(conf); err != nil {
+		panic(err)
 	}
+
+	if err := validateConf(conf); err != nil {
+		panic(err)
+	}
+
+	log.Infof("use defualt value %+v", *conf)
+	return conf
+}
+
+
+func validateConf(conf *IpamConf) error {
+	if conf.Pool.PoolLow > conf.Pool.PoolHigh {
+		return fmt.Errorf("PoolLow should less than PoolHigh")
+	}
+	return nil
 }

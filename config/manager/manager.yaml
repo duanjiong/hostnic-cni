@@ -1,44 +1,7 @@
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRole
-metadata:
-  name: hostnic-node
-rules:
-  - apiGroups: [""]
-    resources:
-      - pods
-      - nodes
-      - namespaces
-    verbs: ["list", "watch", "get","update", "patch"]
-  - apiGroups: ["extensions"]
-    resources:
-      - daemonsets
-    verbs: ["list", "watch"]
----
-apiVersion: v1
-kind: ServiceAccount
-metadata:
-  name: hostnic-node
-  namespace: kube-system
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRoleBinding
-metadata:
-  name: hostnic-node
-roleRef:
-  apiGroup: rbac.authorization.k8s.io
-  kind: ClusterRole
-  name: hostnic-node
-subjects:
-  - kind: ServiceAccount
-    name: hostnic-node
-    namespace: kube-system
----
-
 kind: DaemonSet
 apiVersion: apps/v1
 metadata:
   name: hostnic-node
-  namespace: kube-system
   labels:
     app: hostnic-node
 spec:
@@ -59,12 +22,28 @@ spec:
       hostNetwork: true
       tolerations:
         - operator: Exists
-      containers:
-        - image: duanjiong/hostnic:latest
-          imagePullPolicy: Always
+      initContainers:
+        - name: hostnic-init
+          image: kubesphere/hostnic:latest
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            privileged: true
           command:
-            - sh
-          tty: true
+            - /bin/sh
+          args:
+            - /app/install_hostnic.sh
+          volumeMounts:
+            - mountPath: /opt/cni/bin
+              name: cni-bin-dir
+            - mountPath: /etc/cni/net.d
+              name: cni-net-dir
+            - mountPath: /etc/hostnic/
+              name: hostnic-cfg
+      containers:
+        - image: kubesphere/hostnic:latest
+          imagePullPolicy: IfNotPresent
+          command:
+            - /app/hostnic-agent
           ports:
             - containerPort: 61678
               name: metrics
@@ -88,6 +67,10 @@ spec:
               name: cni-bin-dir
             - mountPath: /etc/cni/net.d
               name: cni-net-dir
+            - mountPath: /etc/hostnic/
+              name: hostnic-cfg
+            - mountPath: /var/lib/hostnic
+              name: hostnic-db
             - mountPath: /var/run/hostnic
               name: hostnic-run
             - mountPath: /root/.qingcloud/
@@ -98,8 +81,6 @@ spec:
               readOnly: true
             - mountPath: /etc/hostnic/
               name: hostnic-cfg
-            - mountPath: /mnt/
-              name: nfs-test
       volumes:
         - name: cni-bin-dir
           hostPath:
@@ -107,6 +88,9 @@ spec:
         - name: cni-net-dir
           hostPath:
             path: /etc/cni/net.d
+        - name: hostnic-db
+          hostPath:
+            path: /var/lib/hostnic
         - name: hostnic-run
           hostPath:
             path: /var/run/hostnic
@@ -127,30 +111,3 @@ spec:
         - name: qingcloud-cfg
           hostPath:
             path:  /etc/qingcloud
-        - name: nfs-test
-          nfs:
-            path: /mnt/sharedfolder/
-            server: 172.22.0.2
-
----
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: hostnic-cfg-cm
-  namespace: kube-system
-data:
-  hostnic: |
-    {
-      "pool":{
-        "poolhigh":10,
-        "poollow":5,
-        "maxnic":60
-      }
-    }
-  hostnic-cni: |
-    {
-      "cniVersion": "0.3.0",
-      "name": "hostnic",
-      "type": "hostnic"
-    }
-

@@ -2,100 +2,87 @@ package qcclient
 
 import (
 	"fmt"
-	"io/ioutil"
-	"math/rand"
-	"net"
-	"strings"
-	"time"
-
+	"github.com/davecgh/go-spew/spew"
+	log "github.com/sirupsen/logrus"
 	"github.com/yunify/hostnic-cni/pkg/errors"
-	"github.com/yunify/hostnic-cni/pkg/qcclient/colors"
-	"github.com/yunify/hostnic-cni/pkg/retry"
 	"github.com/yunify/hostnic-cni/pkg/types"
 	"github.com/yunify/qingcloud-sdk-go/client"
 	"github.com/yunify/qingcloud-sdk-go/config"
 	"github.com/yunify/qingcloud-sdk-go/service"
-	"k8s.io/klog"
+	"io/ioutil"
+	"net"
+	"strings"
+	"time"
 )
 
-func init() {
-	rand.Seed(time.Now().UnixNano())
-}
-
-type LabelResourceConfig struct {
-	ClusterName string
-	ExtraLabels []string
-}
-
 const (
-	nicPrefix           = "hostnic_"
-	instanceIDFile      = "/host/etc/qingcloud/instance-id"
+	instanceIDFile = "/etc/qingcloud/instance-id"
 	defaultOpTimeout    = 180 * time.Second
 	defaultWaitInterval = 10 * time.Second
-	nicNumLimit         = 64
-
-	retryTimes    = 3
-	retryInterval = time.Second * 5
 )
 
 var _ QingCloudAPI = &qingcloudAPIWrapper{}
 
 type qingcloudAPIWrapper struct {
-	err error
-
 	nicService      *service.NicService
-	jobService      *service.JobService
 	vxNetService    *service.VxNetService
 	instanceService *service.InstanceService
 	vpcService      *service.RouterService
-	tagSerivce      *service.TagService
+	jobService      *service.JobService
+	tagService      *service.TagService
 
 	userID      string
 	instanceID  string
 	clusterName string
-	//TODO： label
-	extraLabels   []string
-	vxnetLabelID  string
-	nicLabelID    string
-	labelResource bool
+	nicTagID    string
 }
 
 // NewQingCloudClient create a qingcloud client to manipulate cloud resources
-func NewQingCloudClient(labelConfig *LabelResourceConfig) (QingCloudAPI, error) {
-	content, err := ioutil.ReadFile(instanceIDFile)
+func NewQingCloudClient() QingCloudAPI {
+	instanceID, err := ioutil.ReadFile(instanceIDFile)
 	if err != nil {
-		return nil, fmt.Errorf("Load instance-id from %s error: %v", instanceIDFile, err)
+		panic(fmt.Sprintf("Load instance-id from %s error: %v", instanceIDFile, err))
 	}
+
 	qsdkconfig, err := config.NewDefault()
 	if err != nil {
-		return nil, err
+		panic(err)
 	}
 	if err = qsdkconfig.LoadUserConfig(); err != nil {
-		return nil, err
+		panic(err)
 	}
+
 	qcService, err := service.Init(qsdkconfig)
 	if err != nil {
-		return nil, err
+		panic(err)
 	}
+
 	nicService, err := qcService.Nic(qsdkconfig.Zone)
 	if err != nil {
-		return nil, err
+		panic(err)
 	}
-	jobService, err := qcService.Job(qsdkconfig.Zone)
-	if err != nil {
-		return nil, err
-	}
+
 	vxNetService, err := qcService.VxNet(qsdkconfig.Zone)
 	if err != nil {
-		return nil, err
+		panic(err)
+	}
+
+	jobService, err := qcService.Job(qsdkconfig.Zone)
+	if err != nil {
+		panic(err)
 	}
 
 	instanceService, err := qcService.Instance(qsdkconfig.Zone)
 	if err != nil {
-		return nil, err
+		panic(err)
 	}
+
+	tagService, err := qcService.Tag(qsdkconfig.Zone)
+	if err != nil {
+		panic(err)
+	}
+
 	vpcService, _ := qcService.Router(qsdkconfig.Zone)
-	tagService, _ := qcService.Tag(qsdkconfig.Zone)
 
 	//useid
 	api, _ := qcService.Accesskey(qsdkconfig.Zone)
@@ -103,591 +90,453 @@ func NewQingCloudClient(labelConfig *LabelResourceConfig) (QingCloudAPI, error) 
 		AccessKeys: []*string{&qsdkconfig.AccessKeyID},
 	})
 	if err != nil {
-		klog.Errorf("Failed to get userID")
-		return nil, err
+		panic(err)
 	}
 	if len(output.AccessKeySet) == 0 {
 		err = fmt.Errorf("AccessKey %s have not userid", qsdkconfig.AccessKeyID)
-		return nil, err
+		panic(err)
 	}
-	p := &qingcloudAPIWrapper{
+
+	q := &qingcloudAPIWrapper{
 		nicService:      nicService,
-		jobService:      jobService,
 		vxNetService:    vxNetService,
 		instanceService: instanceService,
 		vpcService:      vpcService,
-		tagSerivce:      tagService,
+		jobService:      jobService,
+		tagService:      tagService,
 		userID:          *output.AccessKeySet[0].Owner,
-		instanceID:      string(content),
-	}
-	if labelConfig != nil {
-		klog.V(2).Infoln("Ensuring labels")
-		p.labelResource = true
-		p.clusterName = labelConfig.ClusterName
-		p.extraLabels = labelConfig.ExtraLabels
-		err = p.ensureLabels()
-		if err != nil {
-			klog.Errorf("Failed to create neccessary labels, labels will be disabled. Error: %s", err.Error())
-			p.labelResource = false
-		}
+		instanceID:      string(instanceID),
 	}
 
-	return p, nil
-}
+	q.nicTagID = q.setupNicTag()
 
-func (q *qingcloudAPIWrapper) ensureLabels() error {
-	toEnsureLabels := []string{fmt.Sprintf("hostnic-vxnet-%s", q.clusterName), fmt.Sprintf("hostnic-nic-%s", q.clusterName)}
-	dests := []*string{&q.vxnetLabelID, &q.nicLabelID}
-	for index := 0; index < len(toEnsureLabels); index++ {
-		if err := q.ensureLabel(toEnsureLabels[index], dests[index]); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func (q *qingcloudAPIWrapper) ensureLabel(label string, des *string) error {
-	klog.Infof("Get tag by label %s", label)
-	l, err := q.GetTagByLabel(label)
-	if err != nil {
-		if errors.IsResourceNotFound(err) {
-			klog.Infof("Creating tag %s", label)
-			id, err := q.CreateTag(label, colors.RandomColor())
-			if err != nil {
-				klog.Errorf("Failed to create tag %s", label)
-				return err
-			}
-			*des = id
-			return nil
-		}
-		klog.Errorf("Failed to get tag by label %s", label)
-		return err
-	}
-	klog.Infof("Found tag %s by label %s", l.ID, label)
-	*des = l.ID
-	return nil
+	return q
 }
 
 func (q *qingcloudAPIWrapper) GetInstanceID() string {
 	return q.instanceID
 }
 
-func (q *qingcloudAPIWrapper) CreateNicsAndAttach(vxnet types.VxNet, count int) ([]*types.HostNic, error) {
-	klog.Infof("Create nics: count=%d, vxnet=%s", count, vxnet.ID)
-	input := &service.CreateNicsInput{
-		Count:   &count,
-		VxNet:   &vxnet.ID,
-		NICName: service.String(nicPrefix + q.instanceID),
+func (q *qingcloudAPIWrapper) AttachNics(nicIDs []string) error {
+	input := &service.AttachNicsInput{
+		Nics:     service.StringSlice(nicIDs),
+		Instance: &q.instanceID,
 	}
-	output, err := q.nicService.CreateNics(input)
+	output, err := q.nicService.AttachNics(input)
 	if err != nil {
-		klog.Errorf("Failed to create nics: count=%d, vxnet=%s", count, vxnet.ID)
-		return nil, err
-	}
-
-	result := make([]*types.HostNic, 0)
-	nics := make([]*string, 0)
-	if *output.RetCode == 0 && len(output.Nics) > 0 {
-		for _, nic := range output.Nics {
-			hostnic := &types.HostNic{
-				ID:           *nic.NICID,
-				VxNet:        &vxnet,
-				HardwareAddr: *nic.NICID,
-				Address:      *nic.PrivateIP,
-				DeviceNumber: -1,
-				IsPrimary:    false,
-			}
-
-			result = append(result, hostnic)
-			nics = append(nics, nic.NICID)
-		}
-
-		input := &service.AttachNicsInput{Nics: nics, Instance: &q.instanceID}
-		output, err := q.nicService.AttachNics(input)
-		if err != nil {
-			//TODO: delete nic
-			return nil, fmt.Errorf("Failed to attach nics, error: %s", *output.Message)
-		}
-
-		return result, nil
-	}
-
-	return nil, fmt.Errorf("Failed to create nics, error: %s", *output.Message)
-}
-
-func (q *qingcloudAPIWrapper) tagResource(tagid, resourceid string, resourceType types.ResourceType) error {
-	if q.labelResource {
-		err := q.TagResources(tagid, resourceType, resourceid)
-		if err != nil {
-			return err
-		}
-		for _, extraLabel := range q.extraLabels {
-			err = q.TagResources(extraLabel, resourceType, resourceid)
-			if err != nil {
-				return err
-			}
-		}
-	}
-	return nil
-}
-
-func (q *qingcloudAPIWrapper) GetAttachedNICs(vxnet string) ([]*types.HostNic, error) {
-	output, err := q.nicService.DescribeNics(&service.DescribeNicsInput{
-		Instances: []*string{&q.instanceID},
-		Limit:     service.Int(nicNumLimit),
-		VxNets:    []*string{&vxnet},
-		VxNetType: []*int{service.Int(1)},
-	})
-	if err != nil {
-		return nil, err
-	}
-	result := make([]*types.HostNic, 0)
-	for _, nic := range output.NICSet {
-		if strings.HasPrefix(*nic.NICName, nicPrefix) {
-			h := &types.HostNic{
-				ID: *nic.NICID,
-				VxNet: &types.VxNet{
-					ID: *nic.VxNetID,
-				},
-				HardwareAddr: *nic.NICID,
-				Address:      *nic.PrivateIP,
-				DeviceNumber: -1,
-				IsPrimary:    false,
-			}
-			result = append(result, h)
-		}
-	}
-	return result, nil
-}
-
-func (q *qingcloudAPIWrapper) DeattachNic(nicIDs string) error {
-	klog.Infof("Deattach nic %s", nicIDs)
-	input := &service.DetachNicsInput{Nics: []*string{&nicIDs}}
-	output, err := q.nicService.DetachNics(input)
-	if err != nil {
-		klog.Errorf("Failed to delete nic %s in cloud, err: %s", nicIDs, err)
 		return err
 	}
-	if *output.RetCode == 0 {
-		return nil
-	}
-	return fmt.Errorf("DetachNics output error %s", *output.Message)
-}
 
-func (q *qingcloudAPIWrapper) DeleteNic(nicID string) error {
-	klog.Infof("Delete nic %s from %s", nicID, q.instanceID)
-	if err := q.DeleteNics([]string{nicID}); err != nil {
-		klog.Errorf("Failed to delete nic %s from %s, err: %s", nicID, q.instanceID, err)
-		return err
+	if *output.RetCode != 0 {
+		return fmt.Errorf("failed to attatch nics: %s", *output.Message)
 	}
 
 	return nil
 }
 
-func (q *qingcloudAPIWrapper) DeleteNics(nicIDs []string) error {
-	input := &service.DeleteNicsInput{Nics: service.StringSlice(nicIDs)}
-	output, err := q.nicService.DeleteNics(input)
-	if err != nil {
-		return err
+func constructHostnic(vxnet *types.VxNet, nic *service.NIC) *types.HostNic {
+	hostnic := &types.HostNic{
+		ID:           *nic.NICID,
+		VxNet:        vxnet,
+		HardwareAddr: *nic.NICID,
+		Address:      *nic.PrivateIP,
 	}
-	if *output.RetCode == 0 {
-		return nil
+
+	if *nic.Role == 1 {
+		hostnic.IsPrimary = true
 	}
-	return fmt.Errorf("DeleteNics output [%+v] error", *output)
+
+	if *nic.Status == "in-use" {
+		hostnic.Using = true
+	}
+
+	return hostnic
 }
 
-func (q *qingcloudAPIWrapper) GetVxNet(vxNet string) (*types.VxNet, error) {
-	klog.Infof("Get vxnet %s", vxNet)
-	output, err := q.GetVxNets([]string{vxNet})
-	if err != nil {
-		klog.Errorf("Failed to get vxnet %s", vxNet)
-		return nil, err
-	}
-	if len(output) == 0 {
-		return nil, errors.NewResourceNotFoundError(types.ResourceTypeVxnet, vxNet)
-	}
-	return output[0], nil
-}
-
-func (q *qingcloudAPIWrapper) GetVxNets(ids []string) ([]*types.VxNet, error) {
-	input := &service.DescribeVxNetsInput{VxNets: service.StringSlice(ids)}
-	output, err := q.vxNetService.DescribeVxNets(input)
-	if err != nil {
-		return nil, err
-	}
-	if *output.RetCode == 0 {
-		var vxNets []*types.VxNet
-		for _, qcVxNet := range output.VxNetSet {
-			vxnetItem := &types.VxNet{ID: *qcVxNet.VxNetID, RouterID: *qcVxNet.VpcRouterID}
-			if qcVxNet.Router != nil {
-				vxnetItem.GateWay = *qcVxNet.Router.ManagerIP
-				_, vxnetItem.Network, _ = net.ParseCIDR(*qcVxNet.Router.IPNetwork)
-			}
-			vxNets = append(vxNets, vxnetItem)
-		}
-		return vxNets, nil
-	}
-	return nil, fmt.Errorf("DescribeVxNets invalid output [%+v]", *output)
-}
-
-func (q *qingcloudAPIWrapper) GetNics(ids []string) ([]*types.HostNic, error) {
+func (q *qingcloudAPIWrapper) GetNics(vxnet *types.VxNet, nics []string) ([]*types.HostNic, error) {
 	input := &service.DescribeNicsInput{
-		Nics: service.StringSlice(ids),
+		Nics: service.StringSlice(nics),
 	}
+
 	output, err := q.nicService.DescribeNics(input)
 	if err != nil {
 		return nil, err
 	}
-	if *output.RetCode == 0 {
-		var niclist []*types.HostNic
+
+	result := make([]*types.HostNic, 0)
+	if *output.RetCode == 0 && len(output.NICSet) > 0 {
 		for _, nic := range output.NICSet {
-			niclist = append(niclist, &types.HostNic{
-				ID: *nic.NICID,
-				VxNet: &types.VxNet{
-					ID: *nic.VxNetID,
-				},
-				HardwareAddr: *nic.NICID,
-				Address:      *nic.PrivateIP,
-			})
+			if vxnet == nil {
+				tmp, err := q.GetVxNets([]string{*nic.VxNetID})
+				if err != nil {
+					return nil, err
+				}
+				vxnet = tmp[*nic.VxNetID]
+			}
+			hostnic := constructHostnic(vxnet, nic)
+			hostnic.Reserved = true
+			result = append(result, hostnic)
 		}
-		return niclist, nil
-	}
-	return nil, fmt.Errorf("DescribeNics Failed [%+v]", *output)
-}
-
-func (q *qingcloudAPIWrapper) CreateVxNet(name string) (*types.VxNet, error) {
-	input := &service.CreateVxNetsInput{
-		VxNetType: service.Int(1),
-		VxNetName: &name,
-	}
-	output, err := q.vxNetService.CreateVxNets(input)
-	if err != nil {
-		return nil, err
-	}
-	if *output.RetCode == 0 {
-		err = q.tagResource(q.vxnetLabelID, *output.VxNets[0], types.ResourceTypeVxnet)
-		if err != nil {
-			klog.Errorf("Failed to attach labels to vxnet %s, will continue. Error: %s", *output.VxNets[0], err.Error())
-		}
-		return &types.VxNet{
-			Name: name,
-			ID:   *output.VxNets[0],
-		}, nil
-	}
-	return nil, fmt.Errorf("Failed to create vxnet %s,err:%s", name, *output.Message)
-}
-
-func (q *qingcloudAPIWrapper) GetNodeVxnet(vxnetName string) (string, error) {
-	klog.Infof("Get hostnic vxnet %s", vxnetName)
-	input := &service.DescribeInstancesInput{
-		Instances: []*string{&q.instanceID},
-		Verbose:   service.Int(1),
-	}
-	output, err := q.instanceService.DescribeInstances(input)
-	if err != nil {
-		return "", err
-	}
-	if len(output.InstanceSet) <= 0 {
-		return "", fmt.Errorf("Cannot find the instance %s", q.instanceID)
-	}
-	instanceItem := output.InstanceSet[0]
-	for _, vxnetItem := range instanceItem.VxNets {
-		if vxnetName == *vxnetItem.VxNetName {
-			return *vxnetItem.VxNetID, nil
-		}
+	} else if *output.RetCode != 0 {
+		return nil, fmt.Errorf("failed to get nics: %s", *output.Message)
 	}
 
-	return "", nil
-}
-
-//TODO: cache result and reduce api request
-func (q *qingcloudAPIWrapper) GetAttachedNicsAndVpc() (*[]types.HostNic, *[]types.VPC, error) {
-	input := &service.DescribeInstancesInput{
-		Instances: []*string{&q.instanceID},
-		Verbose:   service.Int(1),
-	}
-	output, err := q.instanceService.DescribeInstances(input)
-	if err != nil {
-		return nil, nil, err
-	}
-	if len(output.InstanceSet) <= 0 {
-		return nil, nil, fmt.Errorf("Cannot find the instance %s", q.instanceID)
-	}
-	instanceItem := output.InstanceSet[0]
-	var nics []types.HostNic
-	for _, vxnetItem := range instanceItem.VxNets {
-		nic := types.HostNic{
-			ID: *vxnetItem.NICID,
-			VxNet: &types.VxNet{
-				ID:   *vxnetItem.VxNetID,
-				Name: *vxnetItem.VxNetName,
-			},
-			HardwareAddr: *vxnetItem.NICID,
-			Address:      *vxnetItem.PrivateIP,
-			DeviceNumber: -1,
-			IsPrimary:    false,
-		}
-		if *vxnetItem.Role == 1 {
-			nic.IsPrimary = true
-		}
-		nics = append(nics, nic)
-	}
-
-	return nil, nil, nil
-}
-
-func (q *qingcloudAPIWrapper) GetNodeVPC() (*types.VPC, error) {
-	input := &service.DescribeInstancesInput{
-		Instances: []*string{&q.instanceID},
-		Verbose:   service.Int(1),
-	}
-	output, err := q.instanceService.DescribeInstances(input)
-	if err != nil {
-		return nil, err
-	}
-	if len(output.InstanceSet) <= 0 {
-		return nil, fmt.Errorf("Cannot find the instance %s", q.instanceID)
-	}
-	instanceItem := output.InstanceSet[0]
-	var vxnetIds []string
-	for _, vxnetItem := range instanceItem.VxNets {
-		vxnetIds = append(vxnetIds, *vxnetItem.VxNetID)
-	}
-	vxnets, err := q.GetVxNets(vxnetIds)
-	if err != nil {
-		return nil, err
-	}
-	var routerID string
-	for _, vxnetItem := range vxnets {
-		if routerID == "" {
-			routerID = vxnetItem.RouterID
-		} else if routerID != vxnetItem.RouterID {
-			return nil, fmt.Errorf("Vxnet is not under the same VPC's management")
-		}
-	}
-	return q.GetVPC(routerID)
-}
-
-func (q *qingcloudAPIWrapper) GetVPC(id string) (*types.VPC, error) {
-	klog.Infof("Get vpc %s", id)
-	input := &service.DescribeRoutersInput{
-		Routers: []*string{&id},
-		Verbose: service.Int(1),
-	}
-	output, err := q.vpcService.DescribeRouters(input)
-	if err != nil {
-		return nil, err
-	}
-	if len(output.RouterSet) == 0 {
-		return nil, errors.NewResourceNotFoundError(types.ResourceTypeVPC, id)
-	}
-	vpc := &types.VPC{
-		ID: *output.RouterSet[0].RouterID,
-	}
-	_, net, err := net.ParseCIDR(*output.RouterSet[0].VpcNetwork)
-	if err != nil {
-		return nil, err
-	}
-	vpc.Network = net
-	err = retry.Do(3, time.Second*5, func() error {
-		vpc.VxNets, err = q.GetVPCVxNets(vpc.ID)
-		if err != nil {
-			klog.V(3).Infof("[Will retry] Error in get vxnets of vpc %s", vpc.ID)
-			return err
-		}
-		return nil
-	})
-	if err != nil {
-		klog.Errorf("Failed to get vxnets in this vpc %s", vpc.ID)
-	}
-	return vpc, nil
-}
-
-func (q *qingcloudAPIWrapper) GetVPCVxNets(vpcid string) ([]*types.VxNet, error) {
-	klog.Infof("Get vxnet for vpc %s", vpcid)
-
-	input := &service.DescribeRouterVxNetsInput{
-		Router:  &vpcid,
-		Verbose: service.Int(1),
-	}
-	output, err := q.vpcService.DescribeRouterVxNets(input)
-	if err != nil {
-		klog.Errorf("Failed to get vxnets for vpc %s, err:%s", vpcid, err)
-		return nil, err
-	}
-	if *output.RetCode != 0 {
-		err := fmt.Errorf("Failed to call 'DescribeRouterVxNets',err: %s", *output.Message)
-		klog.Error(err.Error())
-		return nil, err
-	}
-	result := make([]*types.VxNet, 0)
-	for _, vxnet := range output.RouterVxNetSet {
-		v := new(types.VxNet)
-		v.ID = *vxnet.VxNetID
-		_, v.Network, _ = net.ParseCIDR(*vxnet.IPNetwork)
-		result = append(result, v)
-	}
 	return result, nil
 }
 
-func (q *qingcloudAPIWrapper) JoinVPC(network, vxnetID, vpcID string) error {
-	input := &service.JoinRouterInput{
-		VxNet:     &vxnetID,
-		Router:    &vpcID,
-		IPNetwork: &network,
+func (q *qingcloudAPIWrapper) GetCreatedNics(num, offset int) ([]*types.HostNic, error) {
+	input := &service.DescribeNicsInput{
+		Limit:   &num,
+		Offset:  &offset,
+		NICName: service.String(types.NicPrefix + q.instanceID),
 	}
-	output, err := q.vpcService.JoinRouter(input)
-	if err != nil {
-		return err
-	}
-	return client.WaitJob(q.jobService, *output.JobID, defaultOpTimeout, defaultWaitInterval)
-}
 
-func (q *qingcloudAPIWrapper) LeaveVPCAndDelete(vxnetID, vpcID string) error {
-	input := &service.LeaveRouterInput{
-		Router: &vpcID,
-		VxNets: []*string{&vxnetID},
-	}
-	output, err := q.vpcService.LeaveRouter(input)
+	output, err := q.nicService.DescribeNics(input)
 	if err != nil {
-		return err
-	}
-	err = client.WaitJob(q.jobService, *output.JobID, defaultOpTimeout, defaultWaitInterval)
-	if err != nil {
-		return err
-	}
-	return q.DeleteVxNet(vxnetID)
-}
-
-func (q *qingcloudAPIWrapper) DeleteVxNet(id string) error {
-	input := &service.DeleteVxNetsInput{
-		VxNets: []*string{&id},
-	}
-	output, err := q.vxNetService.DeleteVxNets(input)
-	if err != nil {
-		return err
+		return nil, err
 	}
 	if *output.RetCode != 0 {
-		return fmt.Errorf("Failed to delete vxnet %s, err: %s", id, *output.Message)
+		return nil, fmt.Errorf("DescribeNics Failed [%+v]", *output)
 	}
-	return nil
+
+	var (
+		nics  []*types.HostNic
+		netID []string
+	)
+	for _, nic := range output.NICSet {
+		hostnic := constructHostnic(&types.VxNet{
+			ID: *nic.VxNetID,
+		}, nic)
+		nics = append(nics, hostnic)
+		netID = append(netID, *nic.VxNetID)
+	}
+
+	if len(netID) > 0 {
+		vxnets, err := q.GetVxNets(RemoveRepByMap(netID))
+		if err != nil {
+			return nil, err
+		}
+
+		for _, nic := range nics {
+			nic.VxNet = vxnets[nic.VxNet.ID]
+		}
+	}
+
+	return nics, nil
 }
 
 func (q *qingcloudAPIWrapper) GetPrimaryNIC() (*types.HostNic, error) {
 	input := &service.DescribeNicsInput{
 		Instances: []*string{&q.instanceID},
 		Status:    service.String("in-use"),
-		Limit:     service.Int(nicNumLimit),
-		VxNetType: []*int{service.Int(1)},
+		Limit:     service.Int(types.NicNumLimit),
 	}
+
 	output, err := q.nicService.DescribeNics(input)
 	if err != nil {
 		return nil, err
 	}
+	if *output.RetCode != 0 {
+		return nil, fmt.Errorf("GetPrimaryNIC Failed [%+v]", *output)
+	}
+
+	var primaryNic *types.HostNic
 	for _, nic := range output.NICSet {
 		if *nic.Role == 1 {
-			return &types.HostNic{
-				ID: *nic.NICID,
-				VxNet: &types.VxNet{
-					ID: *nic.VxNetID,
-				},
-				HardwareAddr: *nic.NICID,
-				Address:      *nic.PrivateIP,
-				IsPrimary:    true,
-				DeviceNumber: -1,
-			}, nil
+			vxnet, err := q.GetVxNets([]string{*nic.VxNetID})
+			if err != nil {
+				return nil, err
+			}
+			primaryNic = constructHostnic(vxnet[*nic.VxNetID], nic)
+			break
 		}
 	}
-	return nil, fmt.Errorf("Could not find the primary nic of instance %s", q.instanceID)
+
+	return primaryNic, nil
 }
 
-func (q *qingcloudAPIWrapper) GetTagByLabel(label string) (*types.Tag, error) {
-	input := &service.DescribeTagsInput{
-		SearchWord: &label,
-		Verbose:    service.Int(1),
+func (q *qingcloudAPIWrapper) GetNicsAndAttach(vxnet *types.VxNet, nics []string) ([]*types.HostNic, error) {
+	input := &service.DescribeNicsInput{
+		Nics: service.StringSlice(nics),
 	}
-	output, err := q.tagSerivce.DescribeTags(input)
+
+	output, err := q.nicService.DescribeNics(input)
 	if err != nil {
 		return nil, err
-	}
-	for _, tag := range output.TagSet {
-		if *tag.Owner == q.userID && *tag.TagName == label {
-			taggedResource := make([]*types.TaggedResource, *tag.ResourceCount)
-			for index, resource := range tag.ResourceTagPairs {
-				taggedResource[index] = &types.TaggedResource{
-					ResourceType: types.ResourceType(*resource.ResourceType),
-					ResourceID:   *resource.ResourceID,
-				}
-			}
-			return &types.Tag{
-				Label:           label,
-				ID:              *tag.TagID,
-				TaggedResources: taggedResource,
-			}, nil
-		}
-	}
-	return nil, errors.NewResourceNotFoundError(types.ResourceTypeTag, label)
-}
-
-func (q *qingcloudAPIWrapper) GetTagByID(id string) (*types.Tag, error) {
-	input := &service.DescribeTagsInput{
-		Tags:    []*string{&id},
-		Verbose: service.Int(1),
-	}
-	output, err := q.tagSerivce.DescribeTags(input)
-	if err != nil {
-		return nil, err
-	}
-	for _, tag := range output.TagSet {
-		taggedResource := make([]*types.TaggedResource, *tag.ResourceCount)
-		for index, resource := range tag.ResourceTagPairs {
-			taggedResource[index] = &types.TaggedResource{
-				ResourceType: types.ResourceType(*resource.ResourceType),
-				ResourceID:   *resource.ResourceID,
-			}
-		}
-		return &types.Tag{
-			Label:           *tag.TagName,
-			ID:              *tag.TagID,
-			TaggedResources: taggedResource,
-		}, nil
-	}
-	return nil, errors.NewResourceNotFoundError(types.ResourceTypeTag, id)
-}
-
-func (q *qingcloudAPIWrapper) CreateTag(label, color string) (string, error) {
-	input := &service.CreateTagInput{
-		Color:   &color,
-		TagName: &label,
-	}
-	output, err := q.tagSerivce.CreateTag(input)
-	if err != nil {
-		return "", err
 	}
 	if *output.RetCode != 0 {
-		return "", fmt.Errorf("Failed to create tag %s, err: %s", label, *output.Message)
+		return nil, fmt.Errorf("failed to get nics: %s", *output.Message)
 	}
-	return *output.TagID, nil
-}
 
-func (q *qingcloudAPIWrapper) TagResources(tagid string, resourceType types.ResourceType, ids ...string) error {
-	tags := make([]*service.ResourceTagPair, len(ids))
-	for index, id := range ids {
-		tags[index] = &service.ResourceTagPair{
-			ResourceID:   service.String(id),
-			ResourceType: service.String(string(resourceType)),
-			TagID:        &tagid,
+	result := make([]*types.HostNic, 0)
+	if *output.RetCode == 0 && len(output.NICSet) > 0 {
+		for _, nic := range output.NICSet {
+			if vxnet == nil {
+				tmp, err := q.GetVxNets([]string{*nic.VxNetID})
+				if err != nil {
+					return nil, err
+				}
+				vxnet = tmp[*nic.VxNetID]
+			}
+			hostnic := constructHostnic(vxnet, nic)
+			hostnic.Reserved = true
+			result = append(result, hostnic)
+		}
+
+		if err = q.AttachNics(nics); err != nil {
+			log.WithFields(log.Fields{
+				"nics": nics,
+			}).WithError(err).Errorf("Maybe you need to manually check why you can't bind")
+			return nil, err
 		}
 	}
-	input := &service.AttachTagsInput{
-		ResourceTagPairs: tags,
+
+	return result, nil
+}
+
+func (q *qingcloudAPIWrapper) CreateNicsAndAttach(vxnet *types.VxNet, num int) ([]*types.HostNic, error) {
+	nicName := types.NicPrefix + q.instanceID
+	input := &service.CreateNicsInput{
+		Count:   service.Int(num),
+		VxNet:   &vxnet.ID,
+		NICName: service.String(nicName),
 	}
-	output, err := q.tagSerivce.AttachTags(input)
+
+	output, err := q.nicService.CreateNics(input)
+	if err != nil {
+		return nil, err
+	}
+
+	if *output.RetCode != 0 {
+		return nil, fmt.Errorf("failed to create nics: %s", *output.Message)
+	}
+
+	result := make([]*types.HostNic, 0)
+	nics := make([]string, 0)
+	for _, nic := range output.Nics {
+		hostnic := types.HostNic{
+			ID:           *nic.NICID,
+			VxNet:        vxnet,
+			HardwareAddr: *nic.NICID,
+			Address:      *nic.PrivateIP,
+		}
+
+		result = append(result, &hostnic)
+		nics = append(nics, *nic.NICID)
+	}
+
+	//may need to tag the card later.
+	/*
+		if err = q.attachNicTag(nics); err != nil {
+			log.WithError(err).Errorf("cannot attach tag for nics %+v", nics)
+			if err = q.DeleteNics(nics); err != nil {
+				log.WithError(err).Errorf("cannot delete nics %+v", nics)
+				return nil, err
+			}
+			return nil, err
+		}
+	*/
+
+	if err = q.AttachNics(nics); err != nil {
+		log.WithError(err).Errorf("cannot attach  nics %+v", nics)
+		if err = q.DeleteNics(nics); err != nil {
+			log.WithError(err).Errorf("cannot delete nics %+v", nics)
+			return nil, err
+		}
+		return nil, err
+	}
+
+	return result, nil
+}
+
+func (q *qingcloudAPIWrapper) DeattachNics(nicIDs []string, sync bool) error {
+	if len(nicIDs) <= 0 {
+		return nil
+	}
+
+	input := &service.DetachNicsInput{
+		Nics: service.StringSlice(nicIDs),
+	}
+	output, err := q.nicService.DetachNics(input)
+	if err != nil {
+		return fmt.Errorf("failed to deattach nics, err=%s, input=%s, output=%s", err, spew.Sdump(input), spew.Sdump(output))
+	}
+
+	if sync {
+		return client.WaitJob(q.jobService, *output.JobID, defaultOpTimeout, defaultWaitInterval)
+	}
+
+	return nil
+}
+
+func (q *qingcloudAPIWrapper) DeleteNics(nicIDs []string) error {
+	if len(nicIDs) <= 0 {
+		return nil
+	}
+
+	input := &service.DeleteNicsInput{
+		Nics: service.StringSlice(nicIDs),
+	}
+	_, err := q.nicService.DeleteNics(input)
+	if err != nil {
+		if strings.Contains(err.Error(), "QingCloud Error: Code (1400)") {
+			return errors.ErrResourceBusy
+		}
+		return err
+	}
+
+	return nil
+}
+
+func (q *qingcloudAPIWrapper) GetVxNets(ids []string) (map[string]*types.VxNet, error) {
+	if len(ids) <= 0 {
+		panic("GetVxNets: empty input")
+	}
+
+	log.WithFields(log.Fields{
+		"VxNets": ids,
+	}).Debug("GetVxNets input")
+
+	input := &service.DescribeVxNetsInput{
+		VxNets: service.StringSlice(ids),
+		Limit:  service.Int(types.NicNumLimit),
+	}
+
+	output, err := q.vxNetService.DescribeVxNets(input)
+	if err != nil {
+		return nil, err
+	}
+
+	if *output.RetCode == 0 {
+		var vxNets []*types.VxNet
+
+		for _, qcVxNet := range output.VxNetSet {
+			vxnetItem := &types.VxNet{
+				ID:       *qcVxNet.VxNetID,
+				RouterID: *qcVxNet.VpcRouterID,
+			}
+
+			if qcVxNet.Router != nil {
+				vxnetItem.GateWay = *qcVxNet.Router.ManagerIP
+				_, vxnetItem.Network, _ = net.ParseCIDR(*qcVxNet.Router.IPNetwork)
+			} else {
+				return nil, fmt.Errorf("vxnet %s should bind to vpc", *qcVxNet.VxNetID)
+			}
+
+			log.Debugf("GetVxnets %+v", vxnetItem)
+			vxNets = append(vxNets, vxnetItem)
+		}
+
+		result := make(map[string]*types.VxNet, 0)
+		for _, vxNet := range vxNets {
+			result[vxNet.ID] = vxNet
+		}
+
+		return result, nil
+	}
+
+	return nil, fmt.Errorf("GetVxNets output message=%s", *output.Message)
+}
+
+func RemoveRepByMap(slc []string) []string {
+	result := []string{}
+	tempMap := map[string]byte{}
+	for _, e := range slc {
+		l := len(tempMap)
+		tempMap[e] = 0
+		if len(tempMap) != l {
+			result = append(result, e)
+		}
+	}
+	return result
+}
+
+func (q *qingcloudAPIWrapper) GetVPC(id string) (*types.VPC, error) {
+	input := &service.DescribeRoutersInput{
+		Routers: []*string{&id},
+	}
+	output, err := q.vpcService.DescribeRouters(input)
+	if err != nil {
+		return nil, err
+	}
+
+	if *output.RetCode == 0 {
+		if len(output.RouterSet) == 0 {
+			return nil, errors.NewResourceNotFoundError(types.ResourceTypeVPC, id)
+		}
+		vpc := &types.VPC{
+			ID: *output.RouterSet[0].RouterID,
+		}
+		_, net, err := net.ParseCIDR(*output.RouterSet[0].VpcNetwork)
+		if err != nil {
+			return nil, err
+		}
+		vpc.Network = net
+		return vpc, nil
+	}
+
+	return nil, fmt.Errorf("DescribeRouters Failed [%+v]", *output)
+}
+
+func (q *qingcloudAPIWrapper) setupNicTag() string {
+	input := &service.DescribeTagsInput{
+		SearchWord: service.String(types.NicPrefix + q.instanceID),
+	}
+
+	output, err := q.tagService.DescribeTags(input)
+	if err != nil {
+		panic(err)
+	}
+
+	if *output.RetCode != 0 {
+		panic(fmt.Errorf("GetNicTag Failed [%+v]", *output.Message))
+	}
+
+	lens := len(output.TagSet)
+	if lens > 1 {
+		panic(fmt.Errorf("multi nic tags: %s", types.NicPrefix+q.instanceID))
+	} else if lens == 0 {
+		input := &service.CreateTagInput{
+			TagName: service.String(types.NicPrefix + q.instanceID),
+		}
+
+		output, err := q.tagService.CreateTag(input)
+		if err != nil {
+			panic(err)
+		}
+
+		if *output.RetCode != 0 {
+			panic(fmt.Errorf("GetNicTag Failed [%+v]", *output.Message))
+		}
+
+		return *output.TagID
+	}
+
+	return *output.TagSet[0].TagID
+}
+
+func (q *qingcloudAPIWrapper) attachNicTag(nics []string) error {
+	var tagPairs []*service.ResourceTagPair
+
+	for _, nic := range nics {
+		tagPairs = append(tagPairs, &service.ResourceTagPair{
+			ResourceID:   &nic,
+			ResourceType: service.String(string(types.ResourceTypeNic)),
+			TagID:        service.String(q.nicTagID),
+		})
+	}
+
+	input := &service.AttachTagsInput{
+		ResourceTagPairs: tagPairs,
+	}
+
+	output, err := q.tagService.AttachTags(input)
 	if err != nil {
 		return err
 	}
 	if *output.RetCode != 0 {
-		return fmt.Errorf("Failed to attach tags,err: %s", *output.Message)
+		return fmt.Errorf("AttachNicTag Failed [%+v]", *output.Message)
 	}
+
 	return nil
 }
